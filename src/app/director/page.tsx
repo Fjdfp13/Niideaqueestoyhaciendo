@@ -2,8 +2,8 @@ import { redirect } from 'next/navigation'
 import { createClient } from '@/lib/supabase/server'
 import { BotonSalir } from '@/components/BotonSalir'
 import { SincronizarPanel } from '@/components/SincronizarPanel'
-import { TendenciaMini } from '@/components/TendenciaMini'
-import { formatPct, formatValor } from '@/lib/format'
+import { TarjetaEmpresa } from '@/components/TarjetaEmpresa'
+import styles from './dashboard.module.css'
 
 type Metrica = { nombre_metrica: string; valor: number; meta: number | null; unidad: string | null }
 type Carga = { id: string; semana_inicio: string; semana_fin: string; metricas: Metrica[] }
@@ -14,17 +14,40 @@ type Empresa = {
   cargas_semanales: Carga[]
 }
 
-function semaforo(cumplimientoPct: number | null, variacion: number | null): { color: string; label: string } {
-  if (cumplimientoPct !== null) {
-    if (cumplimientoPct >= 0.9) return { color: 'var(--verde)', label: 'En meta' }
-    if (cumplimientoPct >= 0.6) return { color: 'var(--ambar)', label: 'Atención' }
-    return { color: 'var(--rojo)', label: 'Riesgo' }
-  }
-  if (variacion !== null) {
-    if (variacion > 0.02) return { color: 'var(--verde)', label: 'Creciendo' }
-    if (variacion < -0.02) return { color: 'var(--rojo)', label: 'Cayendo' }
-  }
-  return { color: 'var(--muted)', label: 'Sin meta' }
+type Punto = { valor: number; meta: number | null; semanaFin: string }
+
+function serieDe(empresas: Empresa[], nombreEmpresa: string, nombreMetrica: string): Punto[] {
+  const empresa = empresas.find((e) => e.nombre === nombreEmpresa)
+  if (!empresa) return []
+  return empresa.cargas_semanales
+    .map((c) => {
+      const m = c.metricas.find((mm) => mm.nombre_metrica === nombreMetrica)
+      return m ? { valor: m.valor, meta: m.meta, semanaFin: c.semana_fin } : null
+    })
+    .filter((x): x is Punto => x !== null)
+    .slice(-6)
+}
+
+function formatoCorto(fechaISO: string): string {
+  const [, m, d] = fechaISO.split('-')
+  const meses = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic']
+  return `${d}-${meses[Number(m) - 1]}`
+}
+
+function formatUsd(v: number): string {
+  return `$${v.toLocaleString('es-VE', { maximumFractionDigits: 0 })}`
+}
+
+function formatNum(v: number): string {
+  return v.toLocaleString('es-VE', { maximumFractionDigits: 0 })
+}
+
+function variacion(serie: Punto[]): number | null {
+  if (serie.length < 2) return null
+  const actual = serie[serie.length - 1].valor
+  const anterior = serie[serie.length - 2].valor
+  if (anterior === 0) return null
+  return (actual - anterior) / anterior
 }
 
 export default async function DirectorPage() {
@@ -50,141 +73,179 @@ export default async function DirectorPage() {
 
   const { data } = await supabase
     .from('empresas')
-    .select('id, nombre, tipo_metrica_principal, cargas_semanales(id, semana_inicio, semana_fin, metricas(nombre_metrica, valor, meta, unidad))')
+    .select(
+      'id, nombre, tipo_metrica_principal, cargas_semanales(id, semana_inicio, semana_fin, metricas(nombre_metrica, valor, meta, unidad))'
+    )
     .order('nombre')
     .order('semana_inicio', { referencedTable: 'cargas_semanales', ascending: true })
 
   const empresas = (data ?? []) as unknown as Empresa[]
+  const hayDatos = empresas.some((e) => e.cargas_semanales.length > 0)
 
-  let empresasEnMeta = 0
-  let empresasEnRiesgo = 0
-  let empresasConMeta = 0
+  const pulso = (serie: Punto[]) => serie.map((p) => ({ valor: p.valor, etiqueta: formatoCorto(p.semanaFin) }))
 
-  const filas = empresas.map((empresa) => {
-    const cargas = empresa.cargas_semanales ?? []
-    const ultimas6 = cargas.slice(-6)
-    const ultima = ultimas6[ultimas6.length - 1]
-    const anterior = ultimas6[ultimas6.length - 2]
+  // AutoClub JAC — ventas
+  const jacVentas = serieDe(empresas, 'AutoClub JAC', 'ventas_unidades')
+  const jacVentasActual = jacVentas[jacVentas.length - 1]
+  const jacVar = variacion(jacVentas)
 
-    const principal = empresa.tipo_metrica_principal
-    const metricaActual = ultima?.metricas.find((m) => m.nombre_metrica === principal) ?? null
-    const metricaAnterior = anterior?.metricas.find((m) => m.nombre_metrica === principal) ?? null
+  // AutoClub JAC — postventa
+  const jacPostventa = serieDe(empresas, 'AutoClub JAC', 'postventa_usd')
+  const jacPostventaActual = jacPostventa[jacPostventa.length - 1]
+  const jacPostventaPct = jacPostventaActual?.meta ? jacPostventaActual.valor / jacPostventaActual.meta : null
 
-    const cumplimientoPct =
-      metricaActual?.meta && metricaActual.meta > 0 ? metricaActual.valor / metricaActual.meta : null
+  // Fibex Telecom
+  const fibexVentas = serieDe(empresas, 'Fibex Telecom', 'ventas_total')
+  const fibexMonto = serieDe(empresas, 'Fibex Telecom', 'monto_total')
+  const fibexArpu = serieDe(empresas, 'Fibex Telecom', 'arpu')
+  const fibexActual = fibexVentas[fibexVentas.length - 1]
+  const fibexMontoActual = fibexMonto[fibexMonto.length - 1]
+  const fibexArpuActual = fibexArpu[fibexArpu.length - 1]
 
-    const variacion =
-      metricaActual && metricaAnterior && metricaAnterior.valor > 0
-        ? (metricaActual.valor - metricaAnterior.valor) / metricaAnterior.valor
-        : null
+  // SmartBuy
+  const smartbuy = serieDe(empresas, 'SmartBuy', 'ventas_usd')
+  const smartbuyActual = smartbuy[smartbuy.length - 1]
+  const smartbuyPct = smartbuyActual?.meta ? smartbuyActual.valor / smartbuyActual.meta : null
 
-    const { color, label } = semaforo(cumplimientoPct, variacion)
+  // Seguros
+  const segurosPolizas = serieDe(empresas, 'La Internacional de Seguros', 'polizas_nuevas')
+  const segurosPrimas = serieDe(empresas, 'La Internacional de Seguros', 'primas_cobradas_usd')
+  const segurosActual = segurosPolizas[segurosPolizas.length - 1]
+  const segurosPrimasActual = segurosPrimas[segurosPrimas.length - 1]
+  const segurosVar = variacion(segurosPolizas)
 
-    if (cumplimientoPct !== null) {
-      empresasConMeta++
-      if (cumplimientoPct >= 0.9) empresasEnMeta++
-    }
-    if (color === 'var(--rojo)') empresasEnRiesgo++
-
-    const tendencia = ultimas6
-      .map((c) => c.metricas.find((m) => m.nombre_metrica === principal)?.valor)
-      .filter((v): v is number => typeof v === 'number')
-
-    return {
-      id: empresa.id,
-      nombre: empresa.nombre,
-      metricaActual,
-      cumplimientoPct,
-      variacion,
-      color,
-      label,
-      tendencia,
-      semanaFin: ultima?.semana_fin ?? null,
-    }
-  })
+  // Crealo
+  const crealo = serieDe(empresas, 'Crealo', 'ventas_usd')
+  const crealoActual = crealo[crealo.length - 1]
+  const crealoVar = variacion(crealo)
 
   return (
-    <main style={{ maxWidth: 1100, margin: '0 auto', padding: '2rem 1rem', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <p className="label-muted">Torre de control</p>
-          <h1 style={{ fontSize: '1.4rem' }}>Dashboard consolidado</h1>
-        </div>
-        <BotonSalir />
-      </header>
-
-      <div className="grid-resumen" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
-        <div className="card">
-          <p className="label-muted">Empresas activas</p>
-          <p style={{ fontSize: '1.8rem', fontWeight: 700 }}>{empresas.length}</p>
-        </div>
-        <div className="card">
-          <p className="label-muted">En meta (de las que tienen meta definida)</p>
-          <p style={{ fontSize: '1.8rem', fontWeight: 700 }}>
-            {empresasEnMeta}/{empresasConMeta}
-          </p>
-        </div>
-        <div className="card">
-          <p className="label-muted">En riesgo</p>
-          <p style={{ fontSize: '1.8rem', fontWeight: 700, color: empresasEnRiesgo > 0 ? 'var(--rojo)' : 'var(--verde)' }}>
-            {empresasEnRiesgo}
-          </p>
+    <div className={styles.page}>
+      <div className={styles.toolbar}>
+        <h1>Dashboard Ejecutivo · Comercializa</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <BotonSalir />
         </div>
       </div>
 
-      {usuario.rol === 'admin' && <SincronizarPanel />}
+      {usuario.rol === 'admin' && (
+        <div style={{ maxWidth: 1760, margin: '0 auto 14px' }}>
+          <SincronizarPanel />
+        </div>
+      )}
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-        {filas.length === 0 && (
-          <div className="card">
-            <p className="label-muted">Todavía no hay datos sincronizados.</p>
+      <div className={styles.slide}>
+        <div className={styles.slideHead}>
+          <h1>Semanal Global</h1>
+          <div className={styles.sub}>
+            {segurosActual ? `corte al ${segurosActual.semanaFin}` : 'sin datos todavía'} · fuente: BD Comercializa
+          </div>
+        </div>
+
+        {!hayDatos ? (
+          <div className={styles.empty}>
+            Todavía no hay datos sincronizados. Usa &quot;Sincronizar ahora&quot; arriba para traer la primera semana.
+          </div>
+        ) : (
+          <div className={styles.grid}>
+            {jacVentasActual && (
+              <TarjetaEmpresa
+                color="var(--jac)"
+                titulo="AutoClub JAC — Ventas (UND totales)"
+                big={formatNum(jacVentasActual.valor)}
+                bigSmall="unidades · mes en curso"
+                kline="Incluye 3 concesionarios + Televentas (Entrega Inmediata + Compra Directa)"
+                pulso={pulso(jacVentas)}
+                stats={
+                  jacVar !== null
+                    ? [{ lbl: 'Var. vs semana anterior', val: `${jacVar >= 0 ? '+' : ''}${(jacVar * 100).toFixed(1)}%`, tono: jacVar >= 0 ? 'ok' : 'bad' }]
+                    : undefined
+                }
+              />
+            )}
+
+            {jacPostventaActual && (
+              <TarjetaEmpresa
+                color="var(--post)"
+                titulo="AutoClub JAC — Postventa ($)"
+                big={formatUsd(jacPostventaActual.valor)}
+                bigSmall="cierre de mes"
+                metaPillPct={jacPostventaPct}
+                pulso={pulso(jacPostventa)}
+              />
+            )}
+
+            {fibexActual && (
+              <TarjetaEmpresa
+                color="var(--fibex)"
+                titulo="Televentas Fibex — # / Monto / ARPU"
+                big={formatNum(fibexActual.valor)}
+                bigSmall={`ventas · ${fibexMontoActual ? formatUsd(fibexMontoActual.valor) : ''} suscripción · ARPU ${fibexArpuActual ? `$${fibexArpuActual.valor}` : ''}`}
+                kline="Hogar + Pymes · único canal reportado para Fibex"
+                pulso={pulso(fibexVentas)}
+              />
+            )}
+
+            {smartbuyActual && (
+              <TarjetaEmpresa
+                color="var(--smart)"
+                titulo="SmartBuy — Ventas totales ($)"
+                big={formatUsd(smartbuyActual.valor)}
+                bigSmall="acum. mes en curso"
+                metaPillPct={smartbuyPct}
+                pulso={pulso(smartbuy)}
+              />
+            )}
+
+            {segurosActual && (
+              <TarjetaEmpresa
+                color="var(--seg)"
+                titulo="La Internacional de Seguros — Pólizas (todos los canales)"
+                wide
+                big={formatNum(segurosActual.valor)}
+                bigSmall="pólizas nuevas · acum. mes"
+                pulso={pulso(segurosPolizas)}
+                stats={[
+                  ...(segurosVar !== null
+                    ? [
+                        {
+                          lbl: 'Var. vs semana anterior',
+                          val: `${segurosVar >= 0 ? '+' : ''}${(segurosVar * 100).toFixed(1)}%`,
+                          tono: segurosVar >= 0 ? ('ok' as const) : ('bad' as const),
+                        },
+                      ]
+                    : []),
+                  ...(segurosPrimasActual
+                    ? [{ lbl: 'Primas cobradas (mes)', val: formatUsd(segurosPrimasActual.valor), tono: 'faint' as const }]
+                    : []),
+                ]}
+              />
+            )}
+
+            {crealoActual && (
+              <TarjetaEmpresa
+                color="var(--crealo)"
+                titulo="Crealo — Ventas totales ($)"
+                wide
+                big={formatUsd(crealoActual.valor)}
+                bigSmall="cierre de mes"
+                kline="Ingresos por servicios de impresión/instalación y alquileres recurrentes a otras marcas del holding y clientes externos."
+                pulso={pulso(crealo)}
+                stats={
+                  crealoVar !== null
+                    ? [{ lbl: 'Var. vs semana anterior', val: `${crealoVar >= 0 ? '+' : ''}${(crealoVar * 100).toFixed(1)}%`, tono: crealoVar >= 0 ? 'ok' : 'bad' }]
+                    : undefined
+                }
+              />
+            )}
           </div>
         )}
 
-        {filas.map((fila) => (
-          <div key={fila.id} className="card" style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '1rem', alignItems: 'center' }}>
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <span style={{ width: 10, height: 10, borderRadius: 3, background: fila.color, display: 'inline-block' }} />
-                <h3 style={{ fontSize: '1rem' }}>{fila.nombre}</h3>
-                <span className="label-muted" style={{ fontSize: '0.75rem' }}>{fila.label}</span>
-              </div>
-
-              {fila.metricaActual ? (
-                <>
-                  <p style={{ fontSize: '1.6rem', fontWeight: 700, marginTop: '0.3rem' }}>
-                    {formatValor(fila.metricaActual.valor, fila.metricaActual.unidad)}{' '}
-                    <span className="label-muted" style={{ fontSize: '0.85rem', fontWeight: 400 }}>
-                      {fila.metricaActual.unidad === 'USD' ? '' : fila.metricaActual.unidad}
-                    </span>
-                  </p>
-                  <p className="label-muted" style={{ fontSize: '0.8rem' }}>
-                    {fila.metricaActual.meta
-                      ? `Meta: ${formatValor(fila.metricaActual.meta, fila.metricaActual.unidad)} · ${
-                          fila.cumplimientoPct !== null ? formatPct(fila.cumplimientoPct) : '—'
-                        } cumplido`
-                      : 'Meta no definida'}
-                    {fila.variacion !== null && (
-                      <>
-                        {' · '}
-                        <span style={{ color: fila.variacion >= 0 ? 'var(--verde)' : 'var(--rojo)' }}>
-                          {fila.variacion >= 0 ? '+' : ''}
-                          {formatPct(fila.variacion)} vs. semana anterior
-                        </span>
-                      </>
-                    )}
-                    {fila.semanaFin ? ` · corte ${fila.semanaFin}` : ''}
-                  </p>
-                </>
-              ) : (
-                <p className="label-muted" style={{ marginTop: '0.3rem' }}>Sin datos aún</p>
-              )}
-            </div>
-
-            <TendenciaMini valores={fila.tendencia} color={fila.color} />
-          </div>
-        ))}
+        <div className={styles.footnote}>
+          Fibex Telecom, AutoClub JAC (unidades), Seguros y SmartBuy se actualizan cada semana. Postventa y Crealo se
+          actualizan cuando cierra el mes. Las tendencias muestran hasta las últimas 6 sincronizaciones guardadas.
+        </div>
       </div>
-    </main>
+    </div>
   )
 }
