@@ -64,6 +64,17 @@ function semanaDesde(fecha: Date) {
   return { semana_inicio: fechaAISO(restarDias(fecha, 6)), semana_fin: fechaAISO(fecha) }
 }
 
+/**
+ * Fuentes como Postventa (solo cierres mensuales) o Crealo (facturas sueltas) no tienen su
+ * propio snapshot semanal. Para saber a qué mes de reporte corresponde la sincronización,
+ * se usa como referencia BD_Ventas_JAC, que sí se actualiza cada semana sin falta.
+ */
+function resolverMesReferencia(wb: XLSX.WorkBook, objetivo: Date): Date {
+  const filas = hojaComoFilas<FilaVentasJAC>(wb, 'BD_Ventas_JAC')
+  const encontrado = filasEnFechaMasReciente(filas, 'Fecha_Corte', objetivo)
+  return encontrado?.fecha ?? objetivo
+}
+
 export function calcularFibexTelecom(wb: XLSX.WorkBook, objetivo: Date): ResultadoEmpresa {
   const filas = hojaComoFilas<FilaFibex>(wb, 'BD_Televentas_Fibex')
   const encontrado = filasEnFechaMasReciente(filas, 'Fecha_Corte', objetivo)
@@ -100,13 +111,15 @@ export function calcularAutoClubJAC(wb: XLSX.WorkBook, objetivo: Date): Resultad
     { nombre_metrica: 'ventas_unidades', valor: unidades, meta: null, unidad: 'unidades' },
   ]
 
-  // Postventa solo tiene cierres mensuales (sin snapshots semanales); se agrega si el mes ya cerró.
+  // Postventa solo tiene cierres mensuales (sin snapshots semanales); se agrega si el mes de
+  // la semana que se está sincronizando (no necesariamente "hoy") ya cerró.
+  const mesReferencia = resolverMesReferencia(wb, objetivo)
   const filasPostventa = hojaComoFilas<FilaPostventa>(wb, 'BD_Postventa')
   const cierreDelMes = filasPostventa.filter(
     (f) =>
       f.Tipo_Registro === 'Cierre Mensual' &&
-      f.Año === objetivo.getUTCFullYear() &&
-      f.Mes_Num === objetivo.getUTCMonth() + 1
+      f.Año === mesReferencia.getUTCFullYear() &&
+      f.Mes_Num === mesReferencia.getUTCMonth() + 1
   )
   if (cierreDelMes.length > 0) {
     const totalUsd = sumar(cierreDelMes, 'USD_Periodo')
@@ -173,16 +186,19 @@ export function calcularSmartBuy(wb: XLSX.WorkBook, objetivo: Date): ResultadoEm
 }
 
 export function calcularCrealo(wb: XLSX.WorkBook, objetivo: Date): ResultadoEmpresa {
-  const filas = hojaComoFilas<FilaCrealo>(wb, 'BD_Ventas_Crealo')
-  const inicioMes = new Date(Date.UTC(objetivo.getUTCFullYear(), objetivo.getUTCMonth(), 1))
-  const objetivoMs = objetivo.getTime()
+  // Crealo no tiene snapshots semanales propios (son facturas sueltas): se usa el mismo mes
+  // de referencia que el resto de las empresas para que la sincronización quede pareja.
+  const mesReferencia = resolverMesReferencia(wb, objetivo)
+  const inicioMes = new Date(Date.UTC(mesReferencia.getUTCFullYear(), mesReferencia.getUTCMonth(), 1))
+  const finMes = new Date(Date.UTC(mesReferencia.getUTCFullYear(), mesReferencia.getUTCMonth() + 1, 0))
 
+  const filas = hojaComoFilas<FilaCrealo>(wb, 'BD_Ventas_Crealo')
   const filasDelMes = filas.filter((f) => {
     if (f.Estado === 'Anulada' || typeof f.Fecha_Emision !== 'number' || f.Total_Ventas_Netas_USD == null) {
       return false
     }
     const fecha = serialAFecha(f.Fecha_Emision)
-    return fecha.getTime() >= inicioMes.getTime() && fecha.getTime() <= objetivoMs
+    return fecha.getTime() >= inicioMes.getTime() && fecha.getTime() <= finMes.getTime()
   })
 
   if (filasDelMes.length === 0) return null
@@ -192,7 +208,7 @@ export function calcularCrealo(wb: XLSX.WorkBook, objetivo: Date): ResultadoEmpr
   return {
     empresaNombre: 'Crealo',
     metricaPrincipal: 'ventas_usd',
-    ...semanaDesde(objetivo),
+    ...semanaDesde(mesReferencia),
     metricas: [{ nombre_metrica: 'ventas_usd', valor: Number(total.toFixed(2)), meta: null, unidad: 'USD' }],
   }
 }
