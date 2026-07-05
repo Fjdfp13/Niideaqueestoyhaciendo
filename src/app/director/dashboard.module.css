@@ -16,6 +16,15 @@
   --crealo: #5c6b1f;
   --post: #8a2b4a;
 
+  /* Los componentes compartidos (BotonSalir, SincronizarPanel) usan las variables
+     del tema oscuro global (globals.css) — se sobreescriben aquí para que se vean
+     legibles dentro de este dashboard, que es de tema claro. */
+  --background: var(--bg);
+  --surface: var(--panel);
+  --foreground: var(--ink);
+  --border: var(--line);
+  --muted: var(--ink-dim);
+
   font-family: 'Segoe UI', system-ui, Arial, sans-serif;
   background: var(--bg);
   color: var(--ink);
