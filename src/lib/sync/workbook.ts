@@ -71,3 +71,45 @@ export function sumar<T>(filas: T[], campo: keyof T): number {
     return acc + (typeof v === 'number' ? v : 0)
   }, 0)
 }
+
+/** Formato "AAAA-MM" para indexar series mensuales. */
+export function claveMes(d: Date): string {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+export function claveMesConDesfase(d: Date, desfaseMeses: number): string {
+  const total = d.getUTCFullYear() * 12 + d.getUTCMonth() + desfaseMeses
+  const año = Math.floor(total / 12)
+  const mes = (((total % 12) + 12) % 12) + 1
+  return `${año}-${String(mes).padStart(2, '0')}`
+}
+
+/**
+ * Agrupa filas por mes calendario de su campo de fecha, quedándose solo con las filas
+ * del snapshot MÁS RECIENTE dentro de cada mes (para el mes en curso, que tiene varios
+ * cortes semanales, esto da el acumulado más actualizado; para meses ya cerrados solo
+ * hay un corte, el de cierre de mes).
+ */
+export function agruparPorMes<T extends Record<string, unknown>>(
+  filas: T[],
+  campoFecha: keyof T
+): Map<string, T[]> {
+  const mejorSerialPorMes = new Map<string, number>()
+
+  for (const fila of filas) {
+    const serial = fila[campoFecha]
+    if (typeof serial !== 'number') continue
+    const key = claveMes(serialAFecha(serial))
+    const actual = mejorSerialPorMes.get(key)
+    if (actual === undefined || serial > actual) mejorSerialPorMes.set(key, serial)
+  }
+
+  const resultado = new Map<string, T[]>()
+  for (const [key, mejorSerial] of mejorSerialPorMes) {
+    resultado.set(
+      key,
+      filas.filter((fila) => fila[campoFecha] === mejorSerial)
+    )
+  }
+  return resultado
+}

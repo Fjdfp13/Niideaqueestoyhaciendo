@@ -1,7 +1,8 @@
+import type { ReactNode } from 'react'
 import styles from '@/app/director/dashboard.module.css'
-import { PulseChart } from './PulseChart'
+import { PulseChart, type PuntoPulso } from './PulseChart'
 
-type Stat = { lbl: string; val: string; tono?: 'ok' | 'warn' | 'bad' | 'faint' }
+export type Stat = { lbl: string; val: string; tono?: 'ok' | 'warn' | 'bad' | 'faint' }
 
 const TONO_CLASE: Record<NonNullable<Stat['tono']>, string> = {
   ok: styles.valOk,
@@ -18,18 +19,24 @@ export function TarjetaEmpresa({
   bigSmall,
   kline,
   metaPillPct,
+  metaPillTexto,
   stats,
   pulso,
+  notaLarga,
+  children,
 }: {
   color: string
   titulo: string
   wide?: boolean
-  big: string
+  big?: string
   bigSmall?: string
   kline?: string
   metaPillPct?: number | null
+  metaPillTexto?: string
   stats?: Stat[]
-  pulso?: { valor: number; etiqueta: string }[]
+  pulso?: PuntoPulso[]
+  notaLarga?: string
+  children?: ReactNode
 }) {
   const metaTono = metaPillPct == null ? null : metaPillPct >= 0.9 ? 'ok' : metaPillPct >= 0.6 ? 'warn' : 'bad'
   const metaClase =
@@ -41,14 +48,16 @@ export function TarjetaEmpresa({
         <span className={styles.dot} style={{ background: color }} />
         {titulo}
       </h3>
-      <div className={styles.big}>
-        {big} {bigSmall && <small>{bigSmall}</small>}
-        {metaPillPct != null && (
-          <span className={`${styles.metaPill} ${metaClase}`}>
-            {(metaPillPct * 100).toLocaleString('es-VE', { maximumFractionDigits: 1 })}% de la meta
-          </span>
-        )}
-      </div>
+      {big && (
+        <div className={styles.big}>
+          {big} {bigSmall && <small>{bigSmall}</small>}
+          {metaPillPct != null && (
+            <span className={`${styles.metaPill} ${metaClase}`}>
+              {metaPillTexto ?? `${(metaPillPct * 100).toLocaleString('es-VE', { maximumFractionDigits: 1 })}% de la meta`}
+            </span>
+          )}
+        </div>
+      )}
       {kline && <div className={styles.kline}>{kline}</div>}
       {pulso && pulso.length > 0 && <PulseChart puntos={pulso} color={color} />}
       {stats && stats.length > 0 && (
@@ -61,6 +70,12 @@ export function TarjetaEmpresa({
           ))}
         </div>
       )}
+      {notaLarga && (
+        <div className={styles.kline} style={{ marginTop: '0.6rem' }}>
+          {notaLarga}
+        </div>
+      )}
+      {children}
     </div>
   )
 }

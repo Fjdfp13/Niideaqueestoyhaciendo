@@ -1,6 +1,15 @@
 import 'server-only'
 import type * as XLSX from 'xlsx'
-import { fechaAISO, filasEnFechaMasReciente, hojaComoFilas, restarDias, serialAFecha, sumar } from './workbook'
+import {
+  agruparPorMes,
+  claveMesConDesfase,
+  fechaAISO,
+  filasEnFechaMasReciente,
+  hojaComoFilas,
+  restarDias,
+  serialAFecha,
+  sumar,
+} from './workbook'
 
 export type MetricaCalculada = {
   nombre_metrica: string
@@ -27,6 +36,7 @@ type FilaPostventa = {
   Mes_Num: number
   Año: number
   Tipo_Registro: string
+  Metrica: string
   USD_Periodo: number | null
   Meta_Mensual: number | null
 }
@@ -38,6 +48,7 @@ type FilaSegurosMensual = {
 
 type FilaPrimasCobradas = {
   Fecha_Corte: number
+  Polizas_Acum_Mes: number
   Monto_USD_Acum_Mes: number
 }
 
@@ -48,7 +59,6 @@ type FilaSmartbuy = {
 }
 
 type FilaCrealo = {
-  Año: number
   Fecha_Emision: number
   Total_Ventas_Netas_USD: number | null
   Estado: string
@@ -56,6 +66,7 @@ type FilaCrealo = {
 
 type FilaFibex = {
   Fecha_Corte: number
+  Semana_Mes: number
   Total_Ventas: number
   Total_Monto_USD: number
 }
@@ -75,6 +86,63 @@ function resolverMesReferencia(wb: XLSX.WorkBook, objetivo: Date): Date {
   return encontrado?.fecha ?? objetivo
 }
 
+function serieMensualSuma<T extends Record<string, unknown>>(
+  wb: XLSX.WorkBook,
+  hoja: string,
+  campoFecha: keyof T,
+  campoValor: keyof T
+): Map<string, number> {
+  const filas = hojaComoFilas<T>(wb, hoja)
+  const porMes = agruparPorMes(filas, campoFecha)
+  const serie = new Map<string, number>()
+  for (const [key, filasMes] of porMes) serie.set(key, sumar(filasMes, campoValor))
+  return serie
+}
+
+/**
+ * Calcula el valor del mes anterior, la variación % vs ese mes, y una proyección para el
+ * mes siguiente. La proyección replica la convención del reporte de referencia: promedio
+ * simple de los últimos 2 o 3 meses (el actual + los cerrados inmediatos anteriores).
+ */
+function statsMensuales(
+  serie: Map<string, number>,
+  mesActualRef: Date,
+  valorActual: number,
+  mesesPromedio: 2 | 3
+): { mesAnterior: number | null; variacion: number | null; proyeccion: number | null } {
+  const mesAnterior = serie.get(claveMesConDesfase(mesActualRef, -1)) ?? null
+  const variacion = mesAnterior !== null && mesAnterior > 0 ? (valorActual - mesAnterior) / mesAnterior : null
+
+  let proyeccion: number | null = null
+  if (mesesPromedio === 2) {
+    if (mesAnterior !== null) proyeccion = (valorActual + mesAnterior) / 2
+  } else {
+    const mesAntepenultimo = serie.get(claveMesConDesfase(mesActualRef, -2)) ?? null
+    if (mesAnterior !== null && mesAntepenultimo !== null) {
+      proyeccion = (valorActual + mesAnterior + mesAntepenultimo) / 3
+    }
+  }
+
+  return { mesAnterior, variacion, proyeccion }
+}
+
+function agregarStatsMensuales(
+  metricas: MetricaCalculada[],
+  prefijo: string,
+  unidad: string,
+  stats: ReturnType<typeof statsMensuales>
+) {
+  if (stats.mesAnterior !== null) {
+    metricas.push({ nombre_metrica: `${prefijo}_mes_anterior`, valor: Math.round(stats.mesAnterior * 100) / 100, meta: null, unidad })
+  }
+  if (stats.variacion !== null) {
+    metricas.push({ nombre_metrica: `${prefijo}_variacion_mes`, valor: Number(stats.variacion.toFixed(4)), meta: null, unidad: 'pct' })
+  }
+  if (stats.proyeccion !== null) {
+    metricas.push({ nombre_metrica: `${prefijo}_proyeccion`, valor: Math.round(stats.proyeccion * 100) / 100, meta: null, unidad })
+  }
+}
+
 export function calcularFibexTelecom(wb: XLSX.WorkBook, objetivo: Date): ResultadoEmpresa {
   const filas = hojaComoFilas<FilaFibex>(wb, 'BD_Televentas_Fibex')
   const encontrado = filasEnFechaMasReciente(filas, 'Fecha_Corte', objetivo)
@@ -82,21 +150,38 @@ export function calcularFibexTelecom(wb: XLSX.WorkBook, objetivo: Date): Resulta
 
   const ventas = sumar(encontrado.filas, 'Total_Ventas')
   const monto = sumar(encontrado.filas, 'Total_Monto_USD')
+  const semanaMes = encontrado.filas.find((f) => typeof f.Semana_Mes === 'number')?.Semana_Mes ?? null
+  const ritmoSemanal = semanaMes && semanaMes > 0 ? ventas / semanaMes : null
+
+  const metricas: MetricaCalculada[] = [
+    { nombre_metrica: 'ventas_total', valor: ventas, meta: null, unidad: 'ventas' },
+    { nombre_metrica: 'monto_total', valor: Number(monto.toFixed(2)), meta: null, unidad: 'USD' },
+    {
+      nombre_metrica: 'arpu',
+      valor: ventas > 0 ? Number((monto / ventas).toFixed(2)) : 0,
+      meta: null,
+      unidad: 'USD',
+    },
+  ]
+
+  if (ritmoSemanal !== null) {
+    // 52/12 semanas por mes en promedio: si se usaran las semanas exactas del mes en curso,
+    // la proyección del mes siguiente coincidiría siempre con el total del mes actual.
+    const SEMANAS_POR_MES = 52 / 12
+    metricas.push({ nombre_metrica: 'ventas_total_ritmo_semanal', valor: Math.round(ritmoSemanal), meta: null, unidad: 'ventas' })
+    metricas.push({
+      nombre_metrica: 'ventas_total_proyeccion',
+      valor: Math.round(ritmoSemanal * SEMANAS_POR_MES),
+      meta: null,
+      unidad: 'ventas',
+    })
+  }
 
   return {
     empresaNombre: 'Fibex Telecom',
     metricaPrincipal: 'ventas_total',
     ...semanaDesde(encontrado.fecha),
-    metricas: [
-      { nombre_metrica: 'ventas_total', valor: ventas, meta: null, unidad: 'ventas' },
-      { nombre_metrica: 'monto_total', valor: monto, meta: null, unidad: 'USD' },
-      {
-        nombre_metrica: 'arpu',
-        valor: ventas > 0 ? Number((monto / ventas).toFixed(2)) : 0,
-        meta: null,
-        unidad: 'USD',
-      },
-    ],
+    metricas,
   }
 }
 
@@ -106,10 +191,13 @@ export function calcularAutoClubJAC(wb: XLSX.WorkBook, objetivo: Date): Resultad
   if (!encontradoVentas) return null
 
   const unidades = sumar(encontradoVentas.filas, 'Unidades_Acum_Mes')
+  const serieUnidades = serieMensualSuma<FilaVentasJAC>(wb, 'BD_Ventas_JAC', 'Fecha_Corte', 'Unidades_Acum_Mes')
+  const statsUnidades = statsMensuales(serieUnidades, encontradoVentas.fecha, unidades, 3)
 
   const metricas: MetricaCalculada[] = [
     { nombre_metrica: 'ventas_unidades', valor: unidades, meta: null, unidad: 'unidades' },
   ]
+  agregarStatsMensuales(metricas, 'ventas_unidades', 'unidades', statsUnidades)
 
   // Postventa solo tiene cierres mensuales (sin snapshots semanales); se agrega si el mes de
   // la semana que se está sincronizando (no necesariamente "hoy") ya cerró.
@@ -121,6 +209,7 @@ export function calcularAutoClubJAC(wb: XLSX.WorkBook, objetivo: Date): Resultad
       f.Año === mesReferencia.getUTCFullYear() &&
       f.Mes_Num === mesReferencia.getUTCMonth() + 1
   )
+
   if (cierreDelMes.length > 0) {
     const totalUsd = sumar(cierreDelMes, 'USD_Periodo')
     const totalMeta = cierreDelMes.reduce((acc, f) => acc + (f.Meta_Mensual ?? 0), 0)
@@ -130,6 +219,24 @@ export function calcularAutoClubJAC(wb: XLSX.WorkBook, objetivo: Date): Resultad
       meta: totalMeta > 0 ? totalMeta : null,
       unidad: 'USD',
     })
+
+    const seriePostventa = new Map<string, number>()
+    for (const [key, filasMes] of agruparPorMes(filasPostventa.filter((f) => f.Tipo_Registro === 'Cierre Mensual'), 'Fecha_Corte')) {
+      seriePostventa.set(key, sumar(filasMes, 'USD_Periodo'))
+    }
+    agregarStatsMensuales(metricas, 'postventa_usd', 'USD', statsMensuales(seriePostventa, mesReferencia, totalUsd, 3))
+
+    const SLUGS: Record<string, string> = {
+      'Ventas Mostrador Rptos $': 'postventa_mostrador',
+      'Ventas Rptos x Servicio $': 'postventa_rptos_servicio',
+      'Ventas Mano de Obra $': 'postventa_mano_obra',
+    }
+    for (const fila of cierreDelMes) {
+      const slug = SLUGS[fila.Metrica]
+      if (slug && fila.USD_Periodo != null) {
+        metricas.push({ nombre_metrica: slug, valor: fila.USD_Periodo, meta: null, unidad: 'USD' })
+      }
+    }
   }
 
   return {
@@ -146,9 +253,13 @@ export function calcularSeguros(wb: XLSX.WorkBook, objetivo: Date): ResultadoEmp
   if (!encontradoMensual) return null
 
   const polizas = sumar(encontradoMensual.filas, 'Polizas_Acum_Mes')
+  const seriePolizas = serieMensualSuma<FilaSegurosMensual>(wb, 'BD_Ventas_Seguros_Mensual', 'Fecha_Corte', 'Polizas_Acum_Mes')
+  const statsPolizas = statsMensuales(seriePolizas, encontradoMensual.fecha, polizas, 3)
+
   const metricas: MetricaCalculada[] = [
     { nombre_metrica: 'polizas_nuevas', valor: polizas, meta: null, unidad: 'pólizas' },
   ]
+  agregarStatsMensuales(metricas, 'polizas_nuevas', 'pólizas', statsPolizas)
 
   const filasPrimas = hojaComoFilas<FilaPrimasCobradas>(wb, 'BD_Primas_Cobradas_Seguros')
   const encontradoPrimas = filasEnFechaMasReciente(filasPrimas, 'Fecha_Corte', objetivo)
@@ -158,6 +269,12 @@ export function calcularSeguros(wb: XLSX.WorkBook, objetivo: Date): ResultadoEmp
       valor: sumar(encontradoPrimas.filas, 'Monto_USD_Acum_Mes'),
       meta: null,
       unidad: 'USD',
+    })
+    metricas.push({
+      nombre_metrica: 'primas_cobradas_polizas',
+      valor: sumar(encontradoPrimas.filas, 'Polizas_Acum_Mes'),
+      meta: null,
+      unidad: 'pólizas',
     })
   }
 
@@ -176,12 +293,17 @@ export function calcularSmartBuy(wb: XLSX.WorkBook, objetivo: Date): ResultadoEm
 
   const valor = sumar(encontrado.filas, 'USD_Acum_Mes')
   const meta = encontrado.filas[0]?.Meta_Mensual ?? null
+  const serie = serieMensualSuma<FilaSmartbuy>(wb, 'BD_Ventas_Smartbuy', 'Fecha_Corte', 'USD_Acum_Mes')
+  const stats = statsMensuales(serie, encontrado.fecha, valor, 3)
+
+  const metricas: MetricaCalculada[] = [{ nombre_metrica: 'ventas_usd', valor, meta, unidad: 'USD' }]
+  agregarStatsMensuales(metricas, 'ventas_usd', 'USD', stats)
 
   return {
     empresaNombre: 'SmartBuy',
     metricaPrincipal: 'ventas_usd',
     ...semanaDesde(encontrado.fecha),
-    metricas: [{ nombre_metrica: 'ventas_usd', valor, meta, unidad: 'USD' }],
+    metricas,
   }
 }
 
@@ -193,23 +315,39 @@ export function calcularCrealo(wb: XLSX.WorkBook, objetivo: Date): ResultadoEmpr
   const finMes = new Date(Date.UTC(mesReferencia.getUTCFullYear(), mesReferencia.getUTCMonth() + 1, 0))
 
   const filas = hojaComoFilas<FilaCrealo>(wb, 'BD_Ventas_Crealo')
-  const filasDelMes = filas.filter((f) => {
-    if (f.Estado === 'Anulada' || typeof f.Fecha_Emision !== 'number' || f.Total_Ventas_Netas_USD == null) {
-      return false
-    }
+  const dentroDelMes = (f: FilaCrealo) => {
+    if (typeof f.Fecha_Emision !== 'number') return false
     const fecha = serialAFecha(f.Fecha_Emision)
     return fecha.getTime() >= inicioMes.getTime() && fecha.getTime() <= finMes.getTime()
-  })
+  }
+
+  const filasDelMes = filas.filter((f) => f.Estado !== 'Anulada' && f.Total_Ventas_Netas_USD != null && dentroDelMes(f))
+  const anuladasDelMes = filas.filter((f) => f.Estado === 'Anulada' && dentroDelMes(f))
 
   if (filasDelMes.length === 0) return null
 
   const total = sumar(filasDelMes, 'Total_Ventas_Netas_USD')
 
+  const serieMensual = new Map<string, number>()
+  for (const f of filas) {
+    if (f.Estado === 'Anulada' || typeof f.Fecha_Emision !== 'number' || f.Total_Ventas_Netas_USD == null) continue
+    const key = `${serialAFecha(f.Fecha_Emision).getUTCFullYear()}-${String(serialAFecha(f.Fecha_Emision).getUTCMonth() + 1).padStart(2, '0')}`
+    serieMensual.set(key, (serieMensual.get(key) ?? 0) + f.Total_Ventas_Netas_USD)
+  }
+  const stats = statsMensuales(serieMensual, mesReferencia, total, 2)
+
+  const metricas: MetricaCalculada[] = [
+    { nombre_metrica: 'ventas_usd', valor: Number(total.toFixed(2)), meta: null, unidad: 'USD' },
+    { nombre_metrica: 'facturas_validas', valor: filasDelMes.length, meta: null, unidad: 'facturas' },
+    { nombre_metrica: 'facturas_anuladas', valor: anuladasDelMes.length, meta: null, unidad: 'facturas' },
+  ]
+  agregarStatsMensuales(metricas, 'ventas_usd', 'USD', stats)
+
   return {
     empresaNombre: 'Crealo',
     metricaPrincipal: 'ventas_usd',
     ...semanaDesde(mesReferencia),
-    metricas: [{ nombre_metrica: 'ventas_usd', valor: Number(total.toFixed(2)), meta: null, unidad: 'USD' }],
+    metricas,
   }
 }
 
